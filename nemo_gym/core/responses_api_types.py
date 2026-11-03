@@ -1122,8 +1122,24 @@ NeMoGymResponseOutputItem = Annotated[
 _register_item_tags(NeMoGymResponseOutputItem, _RESPONSE_OUTPUT_ITEM_TAG_BY_CLASS)
 
 
+def _token_count_or_none(value: Any) -> Optional[int]:
+    """A reported token count is a nonnegative int; anything else (a bool, a string, a float) is not a measurement."""
+    return value if type(value) is int and value >= 0 else None
+
+
 class NeMoGymResponseInputTokensDetails(ResponseInputTokensDetails):
     cached_tokens: Optional[int]
+    # Tokens written to the provider's prompt cache (OpenAI `cache_write_tokens`); None when not reported, never 0.
+    cache_write_tokens: Annotated[Optional[int], BeforeValidator(_token_count_or_none)] = None
+
+    # No return annotation, so the serialization schema stays the model's own.
+    @model_serializer(mode="wrap")
+    def _omit_unreported_cache_writes(self, handler: Any):
+        # Most providers never report cache writes; leaving the key out keeps their serialized usage unchanged.
+        data = handler(self)
+        if data.get("cache_write_tokens") is None:
+            data.pop("cache_write_tokens", None)
+        return data
 
 
 class NeMoGymResponseOutputTokensDetails(ResponseOutputTokensDetails):
@@ -1138,7 +1154,7 @@ class NeMoGymResponseUsage(ResponseUsage):
     def sum_from_list(cls, usages: "NeMoGymResponseUsage") -> "NeMoGymResponseUsage":
         final_usage = NeMoGymResponseUsage(
             input_tokens=0,
-            input_tokens_details=NeMoGymResponseInputTokensDetails(cached_tokens=0),
+            input_tokens_details=NeMoGymResponseInputTokensDetails(cached_tokens=0, cache_write_tokens=0),
             output_tokens=0,
             output_tokens_details=NeMoGymResponseOutputTokensDetails(reasoning_tokens=0),
             total_tokens=0,
@@ -1148,6 +1164,10 @@ class NeMoGymResponseUsage(ResponseUsage):
             final_usage.input_tokens_details.cached_tokens = _add_optional_token_counts(
                 final_usage.input_tokens_details.cached_tokens,
                 usage.input_tokens_details.cached_tokens,
+            )
+            final_usage.input_tokens_details.cache_write_tokens = _add_optional_token_counts(
+                final_usage.input_tokens_details.cache_write_tokens,
+                usage.input_tokens_details.cache_write_tokens,
             )
             final_usage.output_tokens += usage.output_tokens
             final_usage.output_tokens_details.reasoning_tokens = _add_optional_token_counts(
@@ -1183,6 +1203,10 @@ def accumulate_response_usage(
         result.input_tokens_details.cached_tokens = _add_optional_token_counts(
             result.input_tokens_details.cached_tokens,
             additional.input_tokens_details.cached_tokens,
+        )
+        result.input_tokens_details.cache_write_tokens = _add_optional_token_counts(
+            result.input_tokens_details.cache_write_tokens,
+            additional.input_tokens_details.cache_write_tokens,
         )
     if result.output_tokens_details is not None and additional.output_tokens_details is not None:
         result.output_tokens_details.reasoning_tokens = _add_optional_token_counts(
