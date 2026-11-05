@@ -51,6 +51,7 @@ from nemo_gym.metrics.metrics_config import (
 from nemo_gym.metrics.metrics_config import (
     is_primary_metric as is_repeat_aggregatable_metric,
 )
+from nemo_gym.trajectory.trajectory_record import CapturedCallRunSummary, CapturedCallSummary
 
 
 class RewardProfileConfig(BaseNeMoGymCLIConfig):
@@ -1116,6 +1117,37 @@ def compute_perf_summary(ng_perf_records: List[Dict[str, Any]], total_rollouts: 
     return summary
 
 
+def compute_captured_call_summary(
+    captured_call_records: List[CapturedCallSummary], total_rollouts: int
+) -> Optional[CapturedCallRunSummary]:
+    """Add per-rollout ``ng_captured_calls`` summaries into run totals by call role.
+
+    ``rollouts_with_capture`` out of ``total_rollouts`` says how much of the run the totals cover; a run
+    with capture off has no records and returns ``None``, never a zero total. ``calls_without_usage``
+    counts calls whose tokens are unknown, which the token totals do not include. ``call_latency_ms`` is
+    summed call time, not run wall-clock: calls overlap.
+    """
+    if total_rollouts <= 0 or not captured_call_records:
+        return None
+    by_role: Dict[str, Dict[str, Any]] = {}
+    for record in captured_call_records:
+        for role, totals in (record.get("by_role") or {}).items():
+            run_totals = by_role.setdefault(role, {})
+            for key, value in totals.items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    run_totals[key] = run_totals.get(key, 0) + value
+    calls = sum(totals.get("calls", 0) for totals in by_role.values())
+    attributed = calls - by_role.get("unattributed", {}).get("calls", 0)
+    return {
+        "rollouts_with_capture": len(captured_call_records),
+        "total_rollouts": total_rollouts,
+        "calls": calls,
+        "calls_without_usage": sum(totals.get("calls_without_usage", 0) for totals in by_role.values()),
+        "attributed_call_coverage": attributed / calls if calls else None,
+        "by_role": by_role,
+    }
+
+
 def _is_finite_number(value: Any) -> bool:
     return isinstance(value, Real) and not isinstance(value, bool) and math.isfinite(float(value))
 
@@ -1231,6 +1263,12 @@ def compute_aggregate_metrics(
         [vr["ng_perf"] for vr in verify_responses if isinstance(vr.get("ng_perf"), dict)],
         total_rollouts=len(verify_responses),
     )
+    captured_calls = compute_captured_call_summary(
+        [vr["ng_captured_calls"] for vr in verify_responses if isinstance(vr.get("ng_captured_calls"), dict)],
+        total_rollouts=len(verify_responses),
+    )
+    if captured_calls is not None:
+        perf_summary = {**(perf_summary or {}), "captured_calls": captured_calls}
 
     if not scored:
         # Every rollout was masked. Publishing means over an empty set would invent a
