@@ -624,7 +624,12 @@ part in partial-rollout checkpoints (`checkpoint_mode = "exported"`):
   logged.
 
 Sessions the agent cannot capture restart after a crash instead: a sandbox the agent owns, multi-turn continuation
-sessions, and sessions that continue an imported conversation (`session_import_path`).
+sessions, sessions that continue an imported conversation (`session_import_path`), and OpenCode 2 sessions (the
+relaunch that resumes a saved conversation uses OpenCode 1's server API and store).
+
+A checkpointed session's reply carries `metadata.harness_launches`: how many times OpenCode was launched for the
+activation. `"1"` means every checkpoint paused it in place; a higher number counts the relaunches after a failed pause
+or a restore.
 
 Settings:
 
@@ -633,5 +638,5 @@ Settings:
 | `sandbox_session_root` | `/tmp/nemo-gym-opencode-sessions` | Must be on the sandbox's snapshotted disk; the saved conversation lives here. |
 | `checkpoint_pause_allowance_seconds` | `3600` | Time a launch may spend paused in all. It extends the provider's command deadline; a longer pause fails the launch. Cover the longest commit. |
 
-The controller's `control_timeout` must cover the pause: a prepare waits until every running OpenCode is paused (up to
-about 45 s for the supervisor to confirm).
+The deadline the controller gives `prepare` (`deadline_ts`) must cover the pause: a prepare waits until every running
+OpenCode is paused (up to about 45 s for the supervisor to confirm).
