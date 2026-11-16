@@ -18,8 +18,6 @@ This file contains patches copied from https://github.com/SWE-bench/SWE-bench/pu
 
 from typing import Any, Dict, Optional
 
-import anyio
-
 # @bxyu-nvidia: We import wildcard because there are a million imports otherwise...
 from swebench.harness.constants import END_TEST_OUTPUT, FAIL_ONLY_REPOS, MAP_REPO_TO_EXT, START_TEST_OUTPUT
 from swebench.harness.run_evaluation import *
@@ -27,7 +25,6 @@ from swebench.harness.run_evaluation import *
 from nemo_gym import PARENT_DIR
 from nemo_gym.sandbox import AsyncSandbox
 from resources_servers.swebench.failure_only_grading import failure_only_suite_completed
-from resources_servers.swebench.sandbox_sessions import STOP_TIMEOUT_S
 
 
 # @bxyu-nvidia: We modify the run_instance function to:
@@ -270,15 +267,9 @@ async def run_instance(
         #
         # Modified code:
         # The result is returned after this block, never from it: a return in `finally` would swallow a cancellation.
-        # A cancelled anyio scope cancels every later await, so the sandbox stop is shielded.
-        # The stop is also bounded, so a hung stop cannot hold the request.
-        # A sandbox that is not stopped here stays in the server's verifier sandboxes.
-        # Session close or expiry stops it later.
+        # The logger is closed in an inner `finally`, so it is closed even when cleanup raises.
         try:
-            with anyio.move_on_after(STOP_TIMEOUT_S, shield=True) as stop_scope:
-                await container.cleanup()
-            if stop_scope.cancelled_caught:
-                logger.warning(f"Verification sandbox for {instance_id} did not stop within {STOP_TIMEOUT_S} seconds")
+            await container.cleanup()
             if rm_image:
                 remove_image(client, test_spec.instance_image_key, logger)
         finally:

@@ -25,6 +25,7 @@ from time import monotonic, time
 from traceback import format_exc
 from typing import Any, Dict, Optional, Sequence, Tuple
 
+import anyio
 from fastapi import Request
 from pydantic import BaseModel, Field, field_validator
 from swebench.harness.run_evaluation import make_test_spec
@@ -62,7 +63,7 @@ from nemo_gym.server_runtime import (
 )
 from nemo_gym.trajectory import SandboxObservation
 from nemo_gym.utils import bounded_text, is_nemo_gym_fastapi_entrypoint
-from resources_servers.swebench.sandbox_sessions import SandboxSessionResourcesServer
+from resources_servers.swebench.sandbox_sessions import STOP_TIMEOUT_S, SandboxSessionResourcesServer
 from resources_servers.swebench.swebench_patches import (
     patch_swebench_multilingual_golden_patch_pass,
     patch_swebench_multilingual_log_parsing,
@@ -263,8 +264,13 @@ class DockerContainer(BaseModel):
             raise
 
     async def cleanup(self) -> None:
+        # A cancelled request cancels every later await, so the stop is shielded.
+        # It is also bounded, so a hung stop cannot hold the request.
+        # A stop that times out is recorded like any other stop failure.
+        # The verifier session then stops the sandbox again.
         try:
-            await self._inner_container.stop()
+            with anyio.fail_after(STOP_TIMEOUT_S, shield=True):
+                await self._inner_container.stop()
         except Exception as exc:
             self._sandbox_error_type = self._sandbox_error_type or type(exc).__name__
             print("Failed to stop verification sandbox", format_exc(), file=sys.stderr)

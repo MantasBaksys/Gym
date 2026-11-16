@@ -32,6 +32,7 @@ from swebench.harness.run_evaluation import make_test_spec
 
 from nemo_gym.client import SESSION_ID_KEY, ServerClient
 from nemo_gym.sandbox import CPU_CAP_ENV_VARS, SandboxExecResult, SandboxHandle
+from resources_servers.swebench import app as swebench_app
 from resources_servers.swebench import swebench_patches
 from resources_servers.swebench.app import (
     DockerContainer,
@@ -649,7 +650,8 @@ class _BlockingEvalSandbox(_FakeEvalSandbox):
         # A stop that finishes without awaiting would pass even when the cancel scope cancels it.
         await anyio.sleep(0.01)
         if self.stop_hangs:
-            await asyncio.Event().wait()
+            # Finite, so a stop that is not bounded finishes late and fails the test instead of hanging it.
+            await anyio.sleep(30)
         self.stopped = True
 
 
@@ -665,7 +667,7 @@ class TestRunInstanceCleanup:
 
     def _start(
         self, monkeypatch: MonkeyPatch, tmp_path: Path, sandbox: _BlockingEvalSandbox
-    ) -> tuple[Coroutine[Any, Any, dict], list[tuple[logging.Logger, logging.FileHandler]]]:
+    ) -> tuple[Coroutine[Any, Any, dict], DockerContainer, list[tuple[logging.Logger, logging.FileHandler]]]:
         monkeypatch.chdir(tmp_path)  # run_instance writes its logs under the working directory
         log_files = []
         setup_logger = swebench_patches.setup_logger
@@ -687,11 +689,11 @@ class TestRunInstanceCleanup:
             client=container,
             run_id="run-id",
         )
-        return verify, log_files
+        return verify, container, log_files
 
     async def test_task_cancel_propagates(self, monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
         sandbox = _BlockingEvalSandbox()
-        verify, log_files = self._start(monkeypatch, tmp_path, sandbox)
+        verify, _, log_files = self._start(monkeypatch, tmp_path, sandbox)
         task = asyncio.create_task(verify)
         await asyncio.wait_for(sandbox.eval_started.wait(), timeout=30)
         task.cancel()
@@ -705,7 +707,7 @@ class TestRunInstanceCleanup:
         self, monkeypatch: MonkeyPatch, tmp_path: Path
     ) -> None:
         sandbox = _BlockingEvalSandbox()
-        verify, log_files = self._start(monkeypatch, tmp_path, sandbox)
+        verify, _, log_files = self._start(monkeypatch, tmp_path, sandbox)
 
         async def cancel_once_started(scope: anyio.CancelScope) -> None:
             with anyio.fail_after(30):
@@ -722,20 +724,21 @@ class TestRunInstanceCleanup:
         assert sandbox.stopped
         assert_log_files_closed(log_files)
 
-    async def test_a_hung_stop_is_abandoned_and_the_result_still_returns(
+    async def test_a_hung_stop_is_abandoned_and_recorded_as_a_timeout(
         self, monkeypatch: MonkeyPatch, tmp_path: Path
     ) -> None:
-        monkeypatch.setattr(swebench_patches, "STOP_TIMEOUT_S", 0.1, raising=False)
+        monkeypatch.setattr(swebench_app, "STOP_TIMEOUT_S", 0.1, raising=False)
         sandbox = _BlockingEvalSandbox(stop_hangs=True)
-        verify, log_files = self._start(monkeypatch, tmp_path, sandbox)
+        verify, container, log_files = self._start(monkeypatch, tmp_path, sandbox)
 
         with anyio.fail_after(5):
             result = await verify
 
         assert not sandbox.stopped
         assert result["completed"] is True and result["resolved"] is True and result["error"] is None
+        # Verify masks a sample whose verification sandbox reports an error, as it does for a stop that raises.
+        assert container._sandbox_error_type == "TimeoutError"
         assert_log_files_closed(log_files)
-        assert "did not stop within 0.1 seconds" in Path(log_files[0][1].baseFilename).read_text()
 
 
 class TestFailureOnlyGrading:
