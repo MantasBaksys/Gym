@@ -12,14 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import base64
 import hashlib
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Coroutine
 from unittest.mock import AsyncMock, MagicMock
 
+import anyio
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -28,6 +31,7 @@ from swebench.harness.run_evaluation import make_test_spec
 
 from nemo_gym.client import SESSION_ID_KEY, ServerClient
 from nemo_gym.sandbox import CPU_CAP_ENV_VARS, SandboxExecResult, SandboxHandle
+from resources_servers.swebench import swebench_patches
 from resources_servers.swebench.app import (
     DockerContainer,
     SwebenchResourcesServer,
@@ -617,6 +621,92 @@ class _FakeEvalSandbox:
 
     async def stop(self) -> None:
         pass
+
+
+class _BlockingEvalSandbox(_FakeEvalSandbox):
+    """A verification sandbox whose evaluation script runs until it is cancelled, and whose stop awaits."""
+
+    def __init__(self) -> None:
+        super().__init__(tests_printed="")
+        self.eval_started = asyncio.Event()
+        self.stop_calls = 0
+
+    async def exec(self, command: str, **kwargs: Any) -> SandboxExecResult:
+        if command != "/bin/bash /eval.sh":
+            return await super().exec(command, **kwargs)
+        self.eval_started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable: the evaluation script runs until it is cancelled")
+
+    async def stop(self) -> None:
+        self.stop_calls += 1
+        await asyncio.sleep(0.01)
+
+
+def assert_log_files_closed(log_files: list[tuple[logging.Logger, logging.FileHandler]]) -> None:
+    assert log_files, "run_instance opened no log file"
+    for logger, handler in log_files:
+        assert handler.stream is None, f"{handler.baseFilename} is still open"
+        assert handler not in logger.handlers
+
+
+class TestRunInstanceCancellation:
+    """A cancelled verification stops its sandbox, closes its log file, and ends cancelled."""
+
+    def _start(
+        self, monkeypatch: MonkeyPatch, tmp_path: Path
+    ) -> tuple[Coroutine[Any, Any, dict], _BlockingEvalSandbox, list[tuple[logging.Logger, logging.FileHandler]]]:
+        monkeypatch.chdir(tmp_path)  # run_instance writes its logs under the working directory
+        log_files = []
+        setup_logger = swebench_patches.setup_logger
+
+        def recording_setup_logger(*args: Any, **kwargs: Any) -> logging.Logger:
+            logger = setup_logger(*args, **kwargs)
+            log_files.extend((logger, h) for h in logger.handlers if isinstance(h, logging.FileHandler))
+            return logger
+
+        monkeypatch.setattr(swebench_patches, "setup_logger", recording_setup_logger)
+        test_spec = make_server()._make_test_spec(SWEBenchVerifyRequest.model_validate(CHART_ROW))
+        sandbox = _BlockingEvalSandbox()
+        container = DockerContainer(id="run-id", instance_id=test_spec.instance_id)
+        container._inner_container = sandbox
+        verify = run_instance(
+            test_spec=test_spec,
+            pred={"instance_id": test_spec.instance_id, "model_patch": "diff --git a/src/a.js b/src/a.js\n"},
+            rm_image=False,
+            force_rebuild=False,
+            client=container,
+            run_id="run-id",
+        )
+        return verify, sandbox, log_files
+
+    async def test_task_cancel_propagates(self, monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+        verify, sandbox, log_files = self._start(monkeypatch, tmp_path)
+        task = asyncio.create_task(verify)
+        await sandbox.eval_started.wait()
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert sandbox.stop_calls == 1
+        assert_log_files_closed(log_files)
+
+    async def test_cancel_scope_closes_the_log_file(self, monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+        verify, sandbox, log_files = self._start(monkeypatch, tmp_path)
+
+        async def cancel_once_started(scope: anyio.CancelScope) -> None:
+            await sandbox.eval_started.wait()
+            scope.cancel()
+
+        with anyio.CancelScope() as scope:
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(cancel_once_started, scope)
+                await verify
+            pytest.fail("run_instance returned after its cancel scope was cancelled")
+
+        assert scope.cancelled_caught
+        assert sandbox.stop_calls == 1
+        assert_log_files_closed(log_files)
 
 
 class TestFailureOnlyGrading:
