@@ -624,23 +624,32 @@ class _FakeEvalSandbox:
 
 
 class _BlockingEvalSandbox(_FakeEvalSandbox):
-    """A verification sandbox whose evaluation script runs until it is cancelled, and whose stop awaits."""
+    """A verification sandbox whose evaluation script runs until it is cancelled, and whose stop has to await to finish.
 
-    def __init__(self) -> None:
-        super().__init__(tests_printed="")
+    With `stop_hangs`, the evaluation script completes a suite with no failures and the stop never finishes instead.
+    """
+
+    def __init__(self, *, stop_hangs: bool = False) -> None:
+        super().__init__(
+            tests_printed="Chrome 120.0.0.0 (Linux x86_64): Executed 1545 of 1545 SUCCESS (43 secs / 33 secs)"
+        )
+        self.stop_hangs = stop_hangs
         self.eval_started = asyncio.Event()
-        self.stop_calls = 0
+        self.stopped = False
 
     async def exec(self, command: str, **kwargs: Any) -> SandboxExecResult:
-        if command != "/bin/bash /eval.sh":
+        if command != "/bin/bash /eval.sh" or self.stop_hangs:
             return await super().exec(command, **kwargs)
         self.eval_started.set()
         await asyncio.Event().wait()
         raise AssertionError("unreachable: the evaluation script runs until it is cancelled")
 
     async def stop(self) -> None:
-        self.stop_calls += 1
-        await asyncio.sleep(0.01)
+        # A stop that finishes without awaiting would pass even when the cancel scope cancels it.
+        await anyio.sleep(0.01)
+        if self.stop_hangs:
+            await asyncio.Event().wait()
+        self.stopped = True
 
 
 def assert_log_files_closed(log_files: list[tuple[logging.Logger, logging.FileHandler]]) -> None:
@@ -650,12 +659,12 @@ def assert_log_files_closed(log_files: list[tuple[logging.Logger, logging.FileHa
         assert handler not in logger.handlers
 
 
-class TestRunInstanceCancellation:
-    """A cancelled verification stops its sandbox, closes its log file, and ends cancelled."""
+class TestRunInstanceCleanup:
+    """`run_instance` stops its sandbox and closes its log file on every path, and never hides a cancellation."""
 
     def _start(
-        self, monkeypatch: MonkeyPatch, tmp_path: Path
-    ) -> tuple[Coroutine[Any, Any, dict], _BlockingEvalSandbox, list[tuple[logging.Logger, logging.FileHandler]]]:
+        self, monkeypatch: MonkeyPatch, tmp_path: Path, sandbox: _BlockingEvalSandbox
+    ) -> tuple[Coroutine[Any, Any, dict], list[tuple[logging.Logger, logging.FileHandler]]]:
         monkeypatch.chdir(tmp_path)  # run_instance writes its logs under the working directory
         log_files = []
         setup_logger = swebench_patches.setup_logger
@@ -667,7 +676,6 @@ class TestRunInstanceCancellation:
 
         monkeypatch.setattr(swebench_patches, "setup_logger", recording_setup_logger)
         test_spec = make_server()._make_test_spec(SWEBenchVerifyRequest.model_validate(CHART_ROW))
-        sandbox = _BlockingEvalSandbox()
         container = DockerContainer(id="run-id", instance_id=test_spec.instance_id)
         container._inner_container = sandbox
         verify = run_instance(
@@ -678,21 +686,25 @@ class TestRunInstanceCancellation:
             client=container,
             run_id="run-id",
         )
-        return verify, sandbox, log_files
+        return verify, log_files
 
     async def test_task_cancel_propagates(self, monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
-        verify, sandbox, log_files = self._start(monkeypatch, tmp_path)
+        sandbox = _BlockingEvalSandbox()
+        verify, log_files = self._start(monkeypatch, tmp_path, sandbox)
         task = asyncio.create_task(verify)
         await sandbox.eval_started.wait()
         task.cancel()
 
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert sandbox.stop_calls == 1
+        assert sandbox.stopped
         assert_log_files_closed(log_files)
 
-    async def test_cancel_scope_closes_the_log_file(self, monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
-        verify, sandbox, log_files = self._start(monkeypatch, tmp_path)
+    async def test_cancel_scope_still_stops_the_sandbox_and_closes_the_log_file(
+        self, monkeypatch: MonkeyPatch, tmp_path: Path
+    ) -> None:
+        sandbox = _BlockingEvalSandbox()
+        verify, log_files = self._start(monkeypatch, tmp_path, sandbox)
 
         async def cancel_once_started(scope: anyio.CancelScope) -> None:
             await sandbox.eval_started.wait()
@@ -705,8 +717,23 @@ class TestRunInstanceCancellation:
             pytest.fail("run_instance returned after its cancel scope was cancelled")
 
         assert scope.cancelled_caught
-        assert sandbox.stop_calls == 1
+        assert sandbox.stopped
         assert_log_files_closed(log_files)
+
+    async def test_a_hung_stop_is_abandoned_and_the_result_still_returns(
+        self, monkeypatch: MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(swebench_patches, "STOP_TIMEOUT_S", 0.1, raising=False)
+        sandbox = _BlockingEvalSandbox(stop_hangs=True)
+        verify, log_files = self._start(monkeypatch, tmp_path, sandbox)
+
+        with anyio.fail_after(5):
+            result = await verify
+
+        assert not sandbox.stopped
+        assert result["completed"] is True and result["resolved"] is True and result["error"] is None
+        assert_log_files_closed(log_files)
+        assert "did not stop within 0.1 seconds" in Path(log_files[0][1].baseFilename).read_text()
 
 
 class TestFailureOnlyGrading:
