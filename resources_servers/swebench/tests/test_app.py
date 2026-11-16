@@ -655,6 +655,18 @@ class _BlockingEvalSandbox(_FakeEvalSandbox):
         self.stopped = True
 
 
+class _StopStartedSandbox(_BlockingEvalSandbox):
+    """A blocking verification sandbox that reports when its stop has started."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stop_started = asyncio.Event()
+
+    async def stop(self) -> None:
+        self.stop_started.set()
+        await super().stop()
+
+
 def assert_log_files_closed(log_files: list[tuple[logging.Logger, logging.FileHandler]]) -> None:
     assert log_files, "run_instance opened no log file"
     for logger, handler in log_files:
@@ -727,7 +739,7 @@ class TestRunInstanceCleanup:
     async def test_a_hung_stop_is_abandoned_and_recorded_as_a_timeout(
         self, monkeypatch: MonkeyPatch, tmp_path: Path
     ) -> None:
-        monkeypatch.setattr(swebench_app, "STOP_TIMEOUT_S", 0.1, raising=False)
+        monkeypatch.setattr(swebench_app, "STOP_TIMEOUT_S", 0.1)
         sandbox = _BlockingEvalSandbox(stop_hangs=True)
         verify, container, log_files = self._start(monkeypatch, tmp_path, sandbox)
 
@@ -738,6 +750,22 @@ class TestRunInstanceCleanup:
         assert result["completed"] is True and result["resolved"] is True and result["error"] is None
         # Verify masks a sample whose verification sandbox reports an error, as it does for a stop that raises.
         assert container._sandbox_error_type == "TimeoutError"
+        assert_log_files_closed(log_files)
+
+    async def test_a_second_cancel_during_the_stop_still_closes_the_log_file(
+        self, monkeypatch: MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # The shield holds off an anyio cancel scope, not a native task cancel, so a second cancel makes cleanup raise.
+        sandbox = _StopStartedSandbox()
+        verify, _, log_files = self._start(monkeypatch, tmp_path, sandbox)
+        task = asyncio.create_task(verify)
+        await asyncio.wait_for(sandbox.eval_started.wait(), timeout=30)
+        task.cancel()
+        await asyncio.wait_for(sandbox.stop_started.wait(), timeout=30)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
         assert_log_files_closed(log_files)
 
 
