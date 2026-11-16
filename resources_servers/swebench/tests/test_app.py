@@ -17,9 +17,10 @@ import base64
 import hashlib
 import json
 import logging
+from collections.abc import Coroutine
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Coroutine
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import anyio
@@ -692,7 +693,7 @@ class TestRunInstanceCleanup:
         sandbox = _BlockingEvalSandbox()
         verify, log_files = self._start(monkeypatch, tmp_path, sandbox)
         task = asyncio.create_task(verify)
-        await sandbox.eval_started.wait()
+        await asyncio.wait_for(sandbox.eval_started.wait(), timeout=30)
         task.cancel()
 
         with pytest.raises(asyncio.CancelledError):
@@ -707,7 +708,8 @@ class TestRunInstanceCleanup:
         verify, log_files = self._start(monkeypatch, tmp_path, sandbox)
 
         async def cancel_once_started(scope: anyio.CancelScope) -> None:
-            await sandbox.eval_started.wait()
+            with anyio.fail_after(30):
+                await sandbox.eval_started.wait()
             scope.cancel()
 
         with anyio.CancelScope() as scope:
