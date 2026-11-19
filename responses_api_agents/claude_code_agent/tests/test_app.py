@@ -1386,6 +1386,7 @@ class TestCapturedUsage:
             runtime="/runtime",
             session=SimpleNamespace(
                 session_dir="/tmp/session",
+                root_dir="/tmp/session",
                 workdir="/app",
                 artifacts=artifacts,
                 cleanup={"timed_out": killed, "return_code": 137 if killed else 0, "cleanup_confirmed": True},
@@ -1416,6 +1417,7 @@ class TestCapturedUsage:
             runtime="/runtime",
             session=SimpleNamespace(
                 session_dir="/tmp/session",
+                root_dir="/tmp/session",
                 workdir="/app",
                 artifacts=artifacts,
                 cleanup={"timed_out": True, "return_code": 137, "cleanup_confirmed": True},
