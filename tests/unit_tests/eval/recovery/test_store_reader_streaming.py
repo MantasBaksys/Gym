@@ -122,8 +122,8 @@ def test_a_large_store_selects_the_same_outcomes_with_bounded_memory(tmp_path, m
     full, full_peak = _peak(lambda: RolloutStore.read(output, import_legacy=False))
     monkeypatch.setattr(records, "PROJECTED_ROW_BYTES", 1 << 20)
     projected, peak = _peak(lambda: RolloutStore.read(output, import_legacy=False, skip_keys=STORE_SKIP_KEYS))
-    # Each row carries 12 MiB of trajectory: the full read holds a whole parsed row, the projected one a few chunks.
-    assert full_peak > 12 << 20 and peak < 6 << 20, (full_peak, peak)
+    # Each row carries 12 MiB of trajectory; the store indexes neither read with it parsed, only a few chunks.
+    assert peak < 6 << 20, peak
     assert [row["_ng_attempt_index"] for row in projected.pending()] == [
         row["_ng_attempt_index"] for row in full.pending()
     ]
@@ -140,3 +140,70 @@ def test_an_incomplete_final_large_row_is_ignored_like_a_small_one(tmp_path, mon
     monkeypatch.setattr(records, "PROJECTED_ROW_BYTES", 1 << 20)
     rows = list(records._indexed_records(output, skip_keys=STORE_SKIP_KEYS))
     assert len(rows) == 1 and "ng_trajectory" not in rows[0][1]
+
+
+def test_a_resumed_run_indexes_large_rows_without_their_trajectories(tmp_path, monkeypatch):
+    output = _store(tmp_path, rows=4, trajectory_bytes=12 << 20)
+    monkeypatch.setattr(records, "PROJECTED_ROW_BYTES", 1 << 20)
+
+    inputs = [{"_ng_task_index": i, "_ng_rollout_index": 0} for i in range(4)]
+
+    def resume():
+        def prepare():  # the run's own inputs: a resume checks they did not change
+            return inputs, RunManifest.create(tmp_path / "source.jsonl", inputs, {}, {}).model_copy(
+                update={"max_rollout_attempts": 2}
+            )
+
+        with RolloutStore.start_or_resume(output, prepare, resume=True) as store:
+            return (
+                store.coverage(),
+                [r["_ng_attempt_index"] for r in store.pending()],
+                store.selected_records("success"),
+            )
+
+    (coverage, pending, successes), peak = _peak(resume)
+    # 12 MiB of trajectory per row: indexing never parses it, so the peak is a few chunks.
+    assert peak < 6 << 20, peak
+    assert coverage == RolloutStore.read(output, import_legacy=False).coverage()
+    assert pending == [1, 1]  # the two failed rollouts are retried as their second attempt
+    # the records still read back whole
+    rows = [record.read() for record in successes.values()]
+    assert rows and all(len(row["ng_trajectory"]["model_calls"]) == (12 << 20) // 1000 for row in rows)
+
+
+def test_a_record_reads_back_without_its_model_call_history_in_bounded_memory(tmp_path, monkeypatch):
+    # The batch status a resumed run rebuilds reads every success this way: it needs only identities and classes.
+    output = _store(tmp_path, rows=2, trajectory_bytes=12 << 20)
+    monkeypatch.setattr(records, "PROJECTED_ROW_BYTES", 1 << 20)
+    [record] = RolloutStore.read(output, import_legacy=False).selected_records("success").values()
+    row, peak = _peak(lambda: record.read(without=records.MODEL_CALL_HISTORY_KEYS))
+    assert peak < 6 << 20, peak
+    assert "ng_trajectory" not in row and row["reward"] == 1.0 and row["_ng_task_index"] == 1
+    assert "ng_trajectory" in record.read()  # a plain read is whole
+
+
+def test_the_end_of_run_judge_check_reads_one_saved_row_at_a_time(tmp_path):
+    # Every collection ends with this check; holding all selected rows at once grows with the run's size.
+    from nemo_gym.eval.rollout_reverification import due_judge_failures
+
+    inputs = [{"_ng_task_index": i, "_ng_rollout_index": 0} for i in range(8)]
+    source = tmp_path / "source.jsonl"
+    source.write_text("".join(json.dumps(row) + "\n" for row in inputs))
+    output = tmp_path / "artifacts" / "rollouts.jsonl"
+    output.parent.mkdir()
+
+    def prepare():
+        return inputs, RunManifest.create(source, inputs, {}, {}).model_copy(update={"max_rollout_attempts": 2})
+
+    with RolloutStore.start_or_resume(output, prepare, resume=False) as store:
+        for original in inputs:
+            row = dict(original)
+            store.allocate_attempt(row)
+            trajectory = {"model_calls": [{"text": "t" * 1000, "n": n} for n in range(4 << 10)]}  # about 4 MiB
+            store.record_outcome(row | {"reward": 1.0, "response": {"id": "r"}, "ng_trajectory": trajectory})
+    store = RolloutStore.read(output, import_legacy=False)
+    _, one_row = _peak(lambda: next(iter(store.selected_records("success").values())).read())
+    due, peak = _peak(lambda: due_judge_failures(output))
+    assert due == []
+    # eight successes: the check costs about one parsed row, not all of them at once
+    assert peak < 1.4 * one_row, (peak, one_row)

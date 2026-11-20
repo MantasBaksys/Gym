@@ -1505,14 +1505,20 @@ def due_judge_failures(output: Path) -> List[str]:
             for row in store.failures()
             if _is_judge_failure(row) and store._state.failure_count(logical_rollout_id(row)) < cap
         }
-        | {logical_rollout_id(row) for row in store.selected("success") if _reverifiable_saved_result(row)}
+        | {logical_rollout_id(row) for row in _selected_rows(store, "success") if _reverifiable_saved_result(row)}
     )
+
+
+def _selected_rows(store: RolloutStore, disposition: str) -> Iterator[Dict[str, Any]]:
+    """The selected rows one at a time: a run's rows can each be GBs, so they are never all held at once."""
+    for record in store.selected_records(disposition).values():
+        yield record.read()
 
 
 def _settled_count(output: Path) -> int:
     """How many selected results of the run a re-judgment settled."""
     store = RolloutStore.read(output, import_legacy=False)
-    return sum(REJUDGE_OPERATION_ID_KEY in row for row in store.selected("success")) if store is not None else 0
+    return sum(REJUDGE_OPERATION_ID_KEY in row for row in _selected_rows(store, "success")) if store is not None else 0
 
 
 async def rejudge_saved_judge_failures(run_config: Dict[str, Any], output: Path) -> int:

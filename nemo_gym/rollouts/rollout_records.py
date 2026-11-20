@@ -178,10 +178,12 @@ class RolloutRecord:
     # Top-level keys a read-only selection skips in large rows; ``read`` applies the same projection.
     skip_keys: frozenset[str] = frozenset()
 
-    def read(self) -> dict:
-        """Read this record with its effective legacy attempt identity."""
+    def read(self, *, without: frozenset[str] = frozenset()) -> dict:
+        """Read this record with its effective legacy attempt identity; a large row is read without the top-level
+        values named in ``without`` (as well as its ``skip_keys``)."""
+        record = replace(self, skip_keys=self.skip_keys | without) if without - self.skip_keys else self
         with self.path.open("rb") as file:
-            return self._read(file)
+            return record._read(file)
 
     def _read(self, file: BinaryIO) -> dict:
         file.seek(self.offset)
@@ -224,6 +226,10 @@ class _Outcome:
 
 # A read-only selection parses a row above this size without the values of its skipped keys, in chunks.
 PROJECTED_ROW_BYTES = 64 << 20
+# Top-level row values that hold a rollout's model-call history, which grows with the square of its conversation.
+# Indexing and status reads never use them, so a large row is parsed without them there; a record's plain read
+# still returns the whole row.
+MODEL_CALL_HISTORY_KEYS = frozenset({"ng_trajectory", "ng_agent_observations", "ng_model_call_capture"})
 _CHUNK_BYTES = 1 << 20
 _STRUCTURE = re.compile(rb'["{}\[\],:]')
 _NESTED = re.compile(rb'["{}\[\]]')
@@ -362,13 +368,19 @@ class _IncompleteRow(Exception):
 
 
 def _indexed_records(
-    path: Path, *, end_offset: int | None = None, skip_keys: frozenset[str] = frozenset()
+    path: Path,
+    *,
+    end_offset: int | None = None,
+    skip_keys: frozenset[str] = frozenset(),
+    history_keys: frozenset[str] = frozenset(),
 ) -> Iterator[tuple[RolloutRecord, dict]]:
     """Scan one record at a time, retaining its original byte coordinates.
 
     With ``skip_keys`` a row larger than ``PROJECTED_ROW_BYTES`` is read in chunks and parsed without those
-    top-level values, so a read-only selection never holds a whole large row.
+    top-level values, so a read-only selection never holds a whole large row. ``history_keys`` are parsed the
+    same way, but only for the scan: their records still read back the whole row.
     """
+    projected = skip_keys | history_keys
     if not path.exists():
         return
     with path.open("rb") as file:
@@ -378,9 +390,9 @@ def _indexed_records(
         number = 0
         while end_offset is None or offset < end_offset:
             limit = None if end_offset is None else end_offset - offset
-            if skip_keys:
+            if projected:
                 try:
-                    value, length = _read_row(file, limit, skip_keys)
+                    value, length = _read_row(file, limit, projected)
                 except _IncompleteRow:
                     warnings.warn(f"Ignoring incomplete final record in {path} at line {number + 1}.", stacklevel=2)
                     return
@@ -745,6 +757,8 @@ class RolloutRecords:
         """Index outcomes, optionally restricted to prefixes captured before the manifest read.
 
         ``skip_keys`` names top-level row values that no selection rule reads; large rows are parsed without them.
+        Indexing also parses large rows without ``MODEL_CALL_HISTORY_KEYS``, whose records still read back whole, except
+        for a legacy import, which compares a saved row with its records.
         """
         expected = list(read_records(materialized_path_for(output)))
         if _digest(expected) != manifest.materialized_digest:
@@ -762,7 +776,10 @@ class RolloutRecords:
         resubmitted = resubmit_offset_path_for(output).exists()
         for path in (failures_path_for(output), output):
             for record, payload in _indexed_records(
-                path, end_offset=outcome_limits[path] if outcome_limits is not None else None, skip_keys=skip_keys
+                path,
+                end_offset=outcome_limits[path] if outcome_limits is not None else None,
+                skip_keys=skip_keys,
+                history_keys=frozenset() if import_legacy else MODEL_CALL_HISTORY_KEYS,
             ):
                 if payload.get("_ng_omitted_rollout") and (
                     payload.get("_ng_dispatch_drained") or payload.get("_ng_unrouted_run_error")

@@ -143,6 +143,7 @@ from nemo_gym.rollouts.omitted_rollouts import omitted_rollout_record
 from nemo_gym.rollouts.rollout_outcomes import InvalidRolloutResult, RolloutFailureRecord, StaleRolloutResult
 from nemo_gym.rollouts.rollout_perf import NG_PERF_KEY, DispatchLatencyTracker, _attach_ng_perf
 from nemo_gym.rollouts.rollout_records import (
+    MODEL_CALL_HISTORY_KEYS,
     RUN_ID_KEY,
     coverage_path_for,
     journal_path_for,
@@ -4343,7 +4344,7 @@ executions → not run again (left to recovery)
             # success into completed work after a newer retry, so status starts from what the Store selected.
             try:
                 batch_completed_rows = [
-                    _batch_status_row(record.read(), batch_agent_refs)
+                    _batch_status_row(record.read(without=MODEL_CALL_HISTORY_KEYS), batch_agent_refs)
                     for record in store.selected_records("success").values()
                 ]
                 batch_failure_rows = [_batch_status_row(row, batch_agent_refs) for row in store.failures()]
